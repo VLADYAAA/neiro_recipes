@@ -1,27 +1,25 @@
 import json
 import re
 import os
-import requests
 from typing import Dict, List, Any, Optional, Tuple
 import logging
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-import torch
 import random
-import time
+
+try:
+    import pymorphy3
+    MORPH_AVAILABLE = True
+except ImportError:
+    print("pymorphy3 не установлен. Установите: pip install pymorphy3")
+    MORPH_AVAILABLE = False
 
 logging.basicConfig(level=logging.ERROR)
 
 class SmartRecipeBot:
-    def __init__(self, recipes_file: str = "recipes.json", ollama_model: str = "mistral:7b-instruct"):
+    def __init__(self, recipes_file: str = "recipes.json"):
         self.recipes = self.load_recipes(recipes_file)
         self.last_search_results = []
         self.last_shown_recipe = None
         self.conversation_context = []
-        self.ollama_url = "http://localhost:11434/api/generate"
-        self.ollama_model = ollama_model
-        
         self.session_state = {
             'previous_recipes': [],
             'current_intent': None,
@@ -31,242 +29,59 @@ class SmartRecipeBot:
             'all_search_results': []
         }
 
-        print("🤖 Загружаю ML модели...")
-        self.load_models()
+        # Инициализация pymorphy3
+        if MORPH_AVAILABLE:
+            self.morph = pymorphy3.MorphAnalyzer()
+            print("pymorphy3 загружен для морфологического анализа")
+        else:
+            self.morph = None
+            print("Использую упрощенный анализ без pymorphy3")
+
+        # Словарь синонимов для основных ингредиентов
+        self.synonyms = {
+            'картофель': ['картошка', 'картошечка', 'картофельный'],
+            'картошка': ['картофель', 'картошечка', 'картофельный'],
+            'гречка': ['гречневая', 'гречневый', 'гречиха'],
+            'гречневая': ['гречка', 'гречневый', 'гречиха'],
+            'рыба': ['рыбный', 'рыбка', 'рыбешка'],
+            'курица': ['куриный', 'курочка', 'цыпленок'],
+            'говядина': ['говяжий', 'говядинка'],
+            'свинина': ['свиной', 'свининка'],
+            # Убрали проблемные синонимы для риса
+            'помидор': ['томат', 'томатный'],
+            'огурец': ['огурчик', 'огурцовый'],
+            'морковь': ['морковка', 'морковный'],
+            'лук': ['луковый', 'луковица'],
+            'чеснок': ['чесночный'],
+            'перец': ['перцевый'],
+            'капуста': ['капустный'],
+            'сыр': ['сырный'],
+            'яйцо': ['яичный', 'яйца'],
+            'молоко': ['молочный'],
+            'сметана': ['сметанный'],
+            'творог': ['творожный'],
+            'мука': ['мучной'],
+            'сахар': ['сахарный'],
+            'масло': ['масляный'],
+            'соль': ['соленый'],
+            'шоколад': ['шоколадный'],
+            'мед': ['медовый'],
+            'орех': ['ореховый'],
+            'яблоко': ['яблочный'],
+            'груша': ['грушевый'],
+            'вишня': ['вишневый'],
+            'клубника': ['клубничный'],
+            'малина': ['малиновый'],
+        }
+
+        # Черный список для проблемных комбинаций
+        self.blacklisted_combinations = {
+            'рис': ['рисовый', 'рисовая', 'рисовое', 'рисовом']
+        }
+
+        print("Инициализирую кулинарного помощника...")
         self.prepare_search_index()
-        print("✅ Модели загружены!")
-
-    def load_models(self):
-        """Загружает ML модели"""
-        try:
-            self.model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
-            print("✅ Загружена универсальная ML модель")
-        except Exception as e:
-            print(f"❌ Ошибка загрузки модели: {e}")
-            self.model = None
-
-    def call_ollama_model(self, prompt: str, max_tokens: int = 150, temperature: float = 0.3) -> str:
-        """Вызов модели Ollama для анализа запросов"""
-        try:
-            data = {
-                "model": self.ollama_model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": temperature,
-                    "top_p": 0.8,
-                    "num_predict": max_tokens,
-                    "stop": ["###", "Пользователь:", "User:"]
-                }
-            }
-            
-            response = requests.post(self.ollama_url, json=data, timeout=30)
-            
-            if response.status_code == 200:
-                result = response.json().get('response', '').strip()
-                return result
-            return ""
-                
-        except Exception as e:
-            print(f"❌ Ошибка вызова Ollama: {e}")
-            return ""
-
-    def extract_keywords_with_ollama(self, query: str) -> Tuple[List[str], List[str]]:
-        """Используем Ollama для выделения ключевых слов"""
-        prompt = f"""Проанализируй кулинарный запрос и выдели ключевые слова для поиска рецептов.
-
-Запрос: "{query}"
-
-Ответь в формате:
-БЛЮДА: слово1, слово2, слово3
-ИНГРЕДИЕНТЫ: слово1, слово2, слово3
-
-Правила:
-- В БЛЮДАХ: названия конкретных блюд (пицца, борщ, салат, омлет)
-- В ИНГРЕДИЕНТАХ: продукты и компоненты (курица, картошка, сыр, гречка)
-- Только существительные, только кулинарные термины
-- Игнорируй глаголы, прилагательные, местоимения
-
-Примеры:
-Запрос: "Найди рецепт греческой мусаки с курицей"
-БЛЮДА: мусака
-ИНГРЕДИЕНТЫ: курица, греческий
-
-Запрос: "Хочу салат с помидорами и огурцами"
-БЛЮДА: салат
-ИНГРЕДИЕНТЫ: помидоры, огурцы
-
-Запрос: "Что приготовить из картошки и грибов"
-БЛЮДА: 
-ИНГРЕДИЕНТЫ: картошка, грибы
-
-Твой анализ:"""
-
-        response = self.call_ollama_model(prompt, max_tokens=100, temperature=0.1)
-        print(f"🧠 Анализ Ollama: {response}")
-        
-        # Парсим ответ
-        dish_names = []
-        ingredients = []
-        
-        # Ищем блюда
-        dishes_match = re.search(r'БЛЮДА:\s*(.*?)(?:\n|$)', response)
-        if dishes_match:
-            dishes_text = dishes_match.group(1).strip()
-            if dishes_text:
-                dish_names = [d.strip().lower() for d in dishes_text.split(',') if d.strip()]
-        
-        # Ищем ингредиенты
-        ingredients_match = re.search(r'ИНГРЕДИЕНТЫ:\s*(.*?)(?:\n|$)', response)
-        if ingredients_match:
-            ingredients_text = ingredients_match.group(1).strip()
-            if ingredients_text:
-                ingredients = [i.strip().lower() for i in ingredients_text.split(',') if i.strip()]
-        
-        # Fallback на старый метод если Ollama не сработал
-        if not dish_names and not ingredients:
-            return self.extract_search_terms_fallback(query)
-        
-        print(f"🔑 Ollama ключи - Блюда: {dish_names}, Ингредиенты: {ingredients}")
-        return dish_names, ingredients
-
-    def extract_search_terms_fallback(self, query: str) -> Tuple[List[str], List[str]]:
-        """Fallback метод извлечения ключевых слов"""
-        query_lower = query.lower()
-        
-        all_keywords = {
-            'бургер', 'пицца', 'крем-брюле', 'оливье', 'борщ', 'цезарь', 'харчо',
-            'шашлык', 'плов', 'паста', 'лазанья', 'суши', 'роллы', 'блины',
-            'сырники', 'пельмени', 'вареники', 'оладьи', 'манник', 'печенье', 
-            'кекс', 'бисквит', 'ганнаш', 'вафли', 'тосты', 'омлет', 'яичница', 
-            'каша', 'творог', 'смузи', 'бутерброд', 'салат', 'суп', 'чипсы', 
-            'рулет', 'котлеты', 'соус', 'мусака', 'греческая мусака',
-            
-            'курица', 'курка', 'куриц', 'куриную', 'куриной', 'куриный', 'грудка',
-            'говядина', 'свинина', 'рыба', 'овощи', 'грибы', 'сыр', 'рис',
-            'картофель', 'помидоры', 'лук', 'чеснок', 'перец', 'морковь',
-            'яйца', 'молоко', 'сметана', 'творог', 'мука', 'сахар',
-            'макароны', 'капуста', 'фасоль', 'горох', 'чечевица', 'яблоки',
-            'шоколад', 'клубника', 'вишня', 'орехи', 'мед', 'кефир', 'йогурт',
-            'сливки', 'масло', 'соль', 'перец',
-            
-            'гречка', 'гречневая', 'гречневая крупа', 'гречневая каша', 'греческий',
-            'греческое', 'греческие'
-        }
-        
-        found_keywords = []
-        
-        for keyword in all_keywords:
-            if keyword in query_lower:
-                found_keywords.append(keyword)
-        
-        if not found_keywords:
-            words = re.findall(r'\b\w+\b', query_lower)
-            for word in words:
-                if len(word) > 3:
-                    matching_keywords = [kw for kw in all_keywords if kw.startswith(word)]
-                    if matching_keywords:
-                        found_keywords.append(matching_keywords[0])
-        
-        # Разделяем на блюда и ингредиенты
-        dish_names = [kw for kw in found_keywords if kw in [
-            'бургер', 'пицца', 'крем-брюле', 'оливье', 'борщ', 'цезарь', 'харчо',
-            'шашлык', 'плов', 'паста', 'лазанья', 'суши', 'роллы', 'блины',
-            'сырники', 'пельмени', 'вареники', 'оладьи', 'манник', 'печенье', 
-            'кекс', 'бисквит', 'ганнаш', 'вафли', 'тосты', 'омлет', 'яичница', 
-            'каша', 'творог', 'смузи', 'бутерброд', 'салат', 'суп', 'чипсы', 
-            'рулет', 'котлеты', 'соус', 'мусака', 'греческая мусака'
-        ]]
-        
-        ingredients = [kw for kw in found_keywords if kw not in dish_names]
-        
-        return dish_names, ingredients
-
-    def prepare_search_index(self):
-        """Подготавливает поисковый индекс"""
-        print("📊 Подготавливаю поисковый индекс...")
-
-        self.search_texts = []
-        self.recipe_indices = []
-        self.recipe_titles = []
-
-        for i, recipe in enumerate(self.recipes):
-            title = recipe.get('title', '').lower()
-            tags = ' '.join(recipe.get('tags', [])).lower()
-            ingredients = ' '.join([str(ing).lower() for ing in recipe.get('ingredients', [])])
-            description = recipe.get('description', '').lower()
-            
-            search_text = f"{title} {title} {title} {ingredients} {tags} {description}"
-            
-            self.search_texts.append(search_text)
-            self.recipe_indices.append(i)
-            self.recipe_titles.append(title)
-
-        if self.model:
-            try:
-                self.recipe_embeddings = self.model.encode(self.search_texts)
-                self.prepare_intent_embeddings()
-                print("✅ Все эмбеддинги созданы")
-            except Exception as e:
-                print(f"❌ Ошибка создания эмбеддингов: {e}")
-
-    def prepare_intent_embeddings(self):
-        """Подготавливает эмбеддинги для классификации намерений"""
-        self.intent_examples = {
-            "точный_поиск": [
-                "рецепт пиццы", "как приготовить борщ", "хочу бургер", 
-                "найди крем-брюле", "рецепт куриной грудки", "шашлык",
-                "приготовь пасту", "рецепт оливье", "суп харчо",
-                "покажи рецепт блинов", "оладьи на кефире", "вафли",
-                "гречка", "сырники", "омлет", "яичница", "куринная грудка",
-                "куриная грудка", "куриные котлеты", "мусака", "греческая мусака",
-                "гречневая крупа", "гречневая каша"
-            ],
-            "общий_поиск": [
-                "что приготовить с курицей", "рецепты с рисом", "блюда из мяса",
-                "что сделать с овощами", "идеи с грибами", "рецепты для ужина",
-                "что можно приготовить из картофеля", "блюда с сыром",
-                "рецепты с яйцами", "что приготовить на завтрак",
-                "хочу что-то с шоколадом", "что-то с рыбой", "что-то с гречкой",
-                "найди что-нибудь с шоколадом", "рецепты с курицей", "завтрак",
-                "что приготовить на завтрак", "идеи для завтрака",
-                "быстрый завтрак", "утренние рецепты", "рецепты для завтрака",
-                "я хочу приготовить куринную грудку", "приготовь мне курицу",
-                "найди что то с гречкой", "рецепт с гречневой крупой",
-                "хочу что-то греческое"
-            ],
-            "рекомендация": [
-                "посоветуй что-нибудь", "что приготовить", "выбери рецепт",
-                "удиви меня", "не знаю что готовить", "давай что-нибудь вкусное",
-                "порекомендуй блюдо", "хочу попробовать что-то новое",
-                "какой рецепт посоветуешь", "что сегодня приготовить"
-            ],
-            "смена_темы": [
-                "другой вариант", "еще рецепт", "следующий", "покажи другой",
-                "не это", "давай что-то другое", "еще вариант", "другой",
-                "следующее блюдо", "попробуем другой рецепт", "хочу другой список",
-                "покажи еще", "дальше", "следующая страница", "еще"
-            ],
-            "приветствие": [
-                "привет", "здравствуйте", "добрый день", "доброе утро",
-                "добрый вечер", "хай", "приветик", "начать", "старт"
-            ],
-            "прощание": [
-                "пока", "до свидания", "выход", "спокойной ночи",
-                "всего доброго", "пока пока", "до встречи", "закончить"
-            ],
-            "общение": [
-                "как дела", "как ты", "что нового", "как жизнь",
-                "что делаешь", "расскажи о себе", "ты кто", "что ты умеешь"
-            ],
-            "благодарность": [
-                "спасибо", "благодарю", "отлично", "супер", "класс"
-            ]
-        }
-
-        self.intent_embeddings = {}
-        for intent, examples in self.intent_examples.items():
-            self.intent_embeddings[intent] = self.model.encode(examples)
+        print("Помощник готов!")
 
     def load_recipes(self, file_path: str) -> List[Dict[str, Any]]:
         """Загружает рецепты из JSON файла"""
@@ -274,311 +89,327 @@ class SmartRecipeBot:
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 if isinstance(data, list):
-                    print(f"✅ Загружено {len(data)} рецептов")
+                    print(f"Загружено {len(data)} рецептов")
                     return data
                 else:
                     return [data]
         except Exception as e:
-            print(f"❌ Ошибка загрузки: {e}")
+            print(f"Ошибка загрузки: {e}")
             return []
 
-    def classify_intent_ml(self, message: str) -> str:
-        """Классифицирует намерение через ML"""
-        if not self.model:
-            return "общий_поиск"
-
-        try:
-            message_embedding = self.model.encode([message])[0]
-            max_similarity = 0
-            detected_intent = "общий_поиск"
-
-            for intent, intent_embeddings in self.intent_embeddings.items():
-                similarities = cosine_similarity([message_embedding], intent_embeddings)[0]
-                avg_similarity = np.mean(similarities)
-                
-                if avg_similarity > max_similarity and avg_similarity > 0.5:
-                    max_similarity = avg_similarity
-                    detected_intent = intent
-
-            self.session_state['current_intent'] = detected_intent
-            return detected_intent
-
-        except Exception as e:
-            print(f"⚠️ Ошибка ML классификации: {e}")
-            return "общий_поиск"
-
-    def recipe_matches_search(self, recipe: Dict[str, Any], dish_names: List[str], ingredients: List[str]) -> Tuple[bool, int, int]:
-        """Проверяет, соответствует ли рецепт поисковому запросу, возвращает (совпадение, счетчик блюд, счетчик ингредиентов)"""
-        if not dish_names and not ingredients:
-            return True, 0, 0
+    def prepare_search_index(self):
+        """Подготавливает поисковый индекс с нормализованными словами"""
+        print("Анализирую рецепты для поискового индекса...")
+        
+        # Собираем все уникальные слова из рецептов в нормальной форме
+        self.all_recipe_words = set()
+        self.recipe_index = {}
+        self.normalized_recipe_index = {}
+        
+        for i, recipe in enumerate(self.recipes):
+            title = recipe.get('title', '').lower()
+            ingredients = ' '.join([str(ing).lower() for ing in recipe.get('ingredients', [])])
+            tags = ' '.join(recipe.get('tags', [])).lower()
+            description = recipe.get('description', '').lower()
             
-        recipe_text = f"{recipe.get('title', '').lower()} {' '.join([str(ing).lower() for ing in recipe.get('ingredients', [])])} {' '.join(recipe.get('tags', []))}"
+            # Создаем поисковый текст для рецепта
+            search_text = f"{title} {ingredients} {tags} {description}"
+            self.recipe_index[i] = search_text
+            
+            # Нормализуем слова для поиска
+            normalized_text = self.normalize_text(search_text)
+            self.normalized_recipe_index[i] = normalized_text
+            
+            # Собираем все нормализованные слова из рецептов
+            words = re.findall(r'\b\w+\b', normalized_text)
+            self.all_recipe_words.update(words)
         
-        dish_match_count = 0
-        ingredient_match_count = 0
+        # Добавляем синонимы в список слов для поиска
+        for base_word, synonym_list in self.synonyms.items():
+            if base_word in self.all_recipe_words:
+                self.all_recipe_words.update(synonym_list)
         
-        # Проверяем названия блюд
-        if dish_names:
-            for dish in dish_names:
-                if dish in recipe_text:
-                    dish_match_count += 1
+        print(f"Проанализировано {len(self.all_recipe_words)} уникальных нормализованных слов")
+
+    def normalize_text(self, text: str) -> str:
+        """Приводит текст к нормальной форме"""
+        if not self.morph:
+            return text
+            
+        words = re.findall(r'\b\w+\b', text)
+        normalized_words = []
         
-        # Проверяем ингредиенты - если больше 2 ингредиентов, требуем чтобы все были в рецепте
-        if ingredients:
-            if len(ingredients) >= 2:
-                # Для 3+ ингредиентов требуем полное совпадение всех
-                all_ingredients_present = True
-                for ingredient in ingredients:
-                    if ingredient not in recipe_text:
-                        all_ingredients_present = False
+        for word in words:
+            if len(word) > 2:  # Игнорируем короткие слова
+                parsed = self.morph.parse(word)[0]
+                normal_form = parsed.normal_form
+                normalized_words.append(normal_form)
+        
+        return ' '.join(normalized_words)
+
+    def normalize_word(self, word: str) -> str:
+        """Приводит одно слово к нормальной форме"""
+        if not self.morph or len(word) <= 2:
+            return word
+            
+        try:
+            parsed = self.morph.parse(word)[0]
+            return parsed.normal_form
+        except:
+            return word
+
+    def expand_with_synonyms(self, word: str) -> List[str]:
+        """Расширяет слово синонимами"""
+        normalized_word = self.normalize_word(word)
+        
+        # Для риса возвращаем только само слово, без синонимов
+        if normalized_word == 'рис':
+            return ['рис']  # Только рис, без рисовый
+        
+        synonyms = [normalized_word]
+        
+        # Добавляем синонимы из словаря для других слов
+        if normalized_word in self.synonyms:
+            synonyms.extend(self.synonyms[normalized_word])
+        
+        # Также проверяем обратные связи
+        for base_word, synonym_list in self.synonyms.items():
+            if normalized_word in synonym_list and base_word not in synonyms:
+                synonyms.append(base_word)
+        
+        return list(set(synonyms))
+    def extract_search_terms(self, query: str) -> List[str]:
+        """Извлекает и нормализует поисковые термины с учетом синонимов"""
+        query_lower = query.lower()
+        
+        # Стоп-слова
+        stop_words = {
+            'привет', 'пока', 'спасибо', 'пожалуйста', 'давай', 'хочу', 
+            'найди', 'покажи', 'рецепт', 'сделать', 'приготовить', 'можно',
+            'что', 'как', 'где', 'когда', 'почему', 'это', 'то', 'такой',
+            'чтобы', 'ты', 'мне', 'для', 'меня', 'подскажи', 'чтото', 'что-то',
+            'нибудь', 'что-нибудь', 'найди', 'найти', 'ищи', 'поиск', 'рецепты',
+            'блюда', 'блюдо', 'чего', 'чем', 'чего-нибудь', 'чего-то', 'чтото',
+            'что-то', 'то', 'со', 'из', 'для', 'на', 'в', 'с', 'и', 'или', 'у',
+            'чего', 'чем', 'какой', 'какая', 'какое', 'какие', 'как', 'такой',
+            'грандшеф', 'гранд', 'шеф', 'давай', 'хочу', 'чтото', 'что-то'
+        }
+        
+        # Извлекаем слова из запроса и нормализуем их
+        query_words = re.findall(r'\b\w+\b', query_lower)
+        
+        # Нормализуем слова и фильтруем
+        search_terms = []
+        for word in query_words:
+            if len(word) > 2 and word not in stop_words:
+                normalized_word = self.normalize_word(word)
+                # Расширяем синонимами
+                word_variants = self.expand_with_synonyms(normalized_word)
+                
+                # Проверяем, есть ли хотя бы один вариант в рецептах
+                for variant in word_variants:
+                    if variant in self.all_recipe_words:
+                        search_terms.append(variant)
                         break
-                if all_ingredients_present:
-                    ingredient_match_count = len(ingredients)
+        
+        print(f"Нормализованные поисковые термины: {search_terms}")
+        return search_terms
+
+    def recipe_matches_search(self, recipe_idx: int, search_terms: List[str]) -> Tuple[bool, int]:
+        """Проверяет, соответствует ли рецепт поисковым терминам (по нормализованному индексу)"""
+        if not search_terms:
+            return False, 0
+            
+        normalized_recipe_text = self.normalized_recipe_index[recipe_idx]
+        recipe_title = self.recipes[recipe_idx].get('title', '').lower()
+        normalized_title = self.normalize_text(recipe_title)
+        
+        # Разбиваем текст рецепта на отдельные слова для точного поиска
+        recipe_words = set(re.findall(r'\b\w+\b', normalized_recipe_text))
+        title_words = set(re.findall(r'\b\w+\b', normalized_title))
+        
+        # Уровни совпадения:
+        # 3 - все термины в названии
+        # 2 - часть терминов в названии + остальные в рецепте
+        # 1 - все термины в рецепте (но не в названии)
+        # 0 - не совпадает
+        
+        title_matches = 0
+        all_terms_in_recipe = True
+        
+        for term in search_terms:
+            # Для риса используем специальную логику
+            if term == 'рис':
+                # Для риса ищем только прямое совпадение "рис", игнорируем "рисовый" и т.д.
+                term_found_in_title = 'рис' in title_words
+                term_found_in_recipe = 'рис' in recipe_words
             else:
-                # Для 1-2 ингредиентов считаем частичные совпадения
-                for ingredient in ingredients:
-                    if ingredient in recipe_text:
-                        ingredient_match_count += 1
-        
-        # Рецепт подходит если:
-        # - Есть совпадения по блюдам ИЛИ
-        # - Есть совпадения по ингредиентам (для 3+ ингредиентов - все должны совпасть)
-        matches = (dish_match_count > 0) or (ingredient_match_count > 0)
-        
-        return matches, dish_match_count, ingredient_match_count
-
-    def enhanced_semantic_search(self, query: str, dish_names: List[str], ingredients: List[str]) -> List[Tuple[Dict[str, Any], float]]:
-        """Улучшенный семантический поиск с правильной сортировкой"""
-        if not self.model:
-            return []
-
-        try:
-            query_embedding = self.model.encode([query])[0]
-            similarities = cosine_similarity([query_embedding], self.recipe_embeddings)[0]
-
-            results = []
+                # Для других слов используем обычную логику с синонимами
+                term_found_in_title = term in title_words
+                term_found_in_recipe = term in recipe_words
+                
+                if not term_found_in_title:
+                    term_variants = self.expand_with_synonyms(term)
+                    term_found_in_title = any(variant in title_words for variant in term_variants)
+                
+                if not term_found_in_recipe:
+                    term_variants = self.expand_with_synonyms(term)
+                    term_found_in_recipe = any(variant in recipe_words for variant in term_variants)
             
-            # Сначала собираем все потенциальные результаты
-            for idx, similarity in enumerate(similarities):
-                recipe = self.recipes[idx]
-                
-                # Проверяем соответствие поисковым терминам
-                matches, dish_count, ingredient_count = self.recipe_matches_search(recipe, dish_names, ingredients)
-                
-                if not matches:
-                    continue
-                
-                # Базовый score
-                base_score = similarity
-                
-                # Усиление за точные совпадения в названии
-                title_boost = 0
-                recipe_title = recipe.get('title', '').lower()
-                for dish in dish_names:
-                    if dish in recipe_title:
-                        title_boost += 0.4
-                
-                # Усиление за ингредиенты
-                ingredient_boost = ingredient_count * 0.2
-                
-                final_score = min(base_score + title_boost + ingredient_boost, 1.0)
-                
-                if final_score > 0.3:
-                    results.append((recipe, final_score, dish_count, ingredient_count))
-
-            # Сортируем результаты по приоритету:
-            # 1. Сначала рецепты с совпадениями по названию блюд
-            # 2. Затем по количеству совпавших ингредиентов
-            # 3. Затем по семантической схожести
-            results.sort(key=lambda x: (x[2] > 0, x[3], x[1]), reverse=True)
+            if term_found_in_title:
+                title_matches += 1
+            if not term_found_in_recipe:
+                all_terms_in_recipe = False
+        
+        if not all_terms_in_recipe:
+            return False, 0
             
-            # Убираем дубликаты и возвращаем только рецепты и scores
-            seen_titles = set()
-            unique_results = []
-            for recipe, score, dish_count, ingredient_count in results:
-                title = recipe.get('title', '')
-                if title not in seen_titles:
-                    seen_titles.add(title)
-                    unique_results.append((recipe, score))
+        if title_matches == len(search_terms):
+            return True, 3  # Все термины в названии
+        elif title_matches > 0:
+            return True, 2  # Часть терминов в названии
+        else:
+            return True, 1  # Все термины только в рецепте
 
-            return unique_results
-
-        except Exception as e:
-            print(f"⚠️ Ошибка семантического поиска: {e}")
-            return []
+    def find_matching_recipes(self, search_terms: List[str]) -> List[Tuple[Dict[str, Any], float]]:
+        """Находит рецепты, соответствующие поисковым терминам с правильной сортировкой"""
+        results = []
+        
+        print(f"Ищу рецепты с точными словами: {search_terms}")
+        
+        for recipe_idx in range(len(self.recipes)):
+            recipe = self.recipes[recipe_idx]
+            
+            # Проверяем соответствие поисковым терминам и получаем уровень совпадения
+            matches, match_level = self.recipe_matches_search(recipe_idx, search_terms)
+            
+            if matches:
+                # Базовый score в зависимости от уровня совпадения
+                if match_level == 3:
+                    score = 1.0  # Максимальный score для совпадения в названии
+                elif match_level == 2:
+                    score = 0.8  # Высокий score для частичного совпадения в названии
+                else:
+                    score = 0.6  # Базовый score для совпадения только в рецепте
+                
+                results.append((recipe, score))
+        
+        # Сортируем по релевантности (score)
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results
 
     def smart_search(self, query: str) -> List[Tuple[Dict[str, Any], float]]:
-        """Умный поиск рецептов с использованием Ollama для анализа"""
-        print(f"🔍 Анализирую запрос: '{query}'")
+        """Умный поиск рецептов с морфологическим анализом"""
+        print(f"Анализирую запрос: '{query}'")
 
-        intent = self.classify_intent_ml(query)
-        print(f"🎯 Намерение: {intent}")
-
-        # Используем Ollama для выделения ключевых слов
-        dish_names, ingredients = self.extract_keywords_with_ollama(query)
-        print(f"🔑 Ключевые слова - Блюда: {dish_names}, Ингредиенты: {ingredients}")
+        search_terms = self.extract_search_terms(query)
+        print(f"Поисковые термины: {search_terms}")
 
         self.session_state['search_query'] = query
         self.session_state['waiting_for_selection'] = False
 
         # Обработка смены темы
-        if intent == "смена_темы" and self.session_state['all_search_results']:
-            self.session_state['current_page'] += 1
-            current_page = self.session_state['current_page']
-            all_results = self.session_state['all_search_results']
-            
-            start_idx = current_page * 5
-            end_idx = start_idx + 5
-            
-            if start_idx < len(all_results):
-                page_results = all_results[start_idx:end_idx]
-                print(f"📄 Показываю страницу {current_page + 1}")
-                return page_results
+        if any(word in query.lower() for word in ['еще', 'дальше', 'следующие', 'покажи еще']):
+            if self.session_state['all_search_results']:
+                self.session_state['current_page'] += 1
+                current_page = self.session_state['current_page']
+                all_results = self.session_state['all_search_results']
+                
+                start_idx = current_page * 5
+                end_idx = start_idx + 5
+                
+                if start_idx < len(all_results):
+                    page_results = all_results[start_idx:end_idx]
+                    print(f"Показываю страницу {current_page + 1}")
+                    return page_results
+                else:
+                    print("Больше нет результатов")
+                    return []
             else:
-                print("📄 Больше нет результатов")
                 return []
 
         # Новый поиск
-        results = self.enhanced_semantic_search(query, dish_names, ingredients)
+        results = self.find_matching_recipes(search_terms)
         
         # Сохраняем все результаты для пагинации
         self.session_state['all_search_results'] = results
         self.session_state['current_page'] = 0
 
-        print(f"🎯 Найдено {len(results)} рецептов")
+        print(f"Найдено {len(results)} рецептов")
         return results[:5] if results else []
 
-    def generate_ollama_response(self, intent: str, query: str) -> str:
-        """Генерирует ответ с помощью Ollama для общения"""
-        if intent == "приветствие":
-            prompt = """Пользователь поздоровался. Ответь кратко и дружелюбно, представься как кулинарный помощник и предложи помощь с рецептами.
-
-Ответ (1-2 предложения):"""
-        
-        elif intent == "общение":
-            prompt = f"""Пользователь: "{query}"
-            
-Ты - кулинарный помощник. Ответь кратко и вежливо, верни разговор к теме рецептов.
-
-Ответ (1-2 предложения):"""
-        
-        elif intent == "благодарность":
-            prompt = f"""Пользователь поблагодарил: "{query}"
-            
-Ответь кратко и вежливо, предложи дальнейшую помощь.
-
-Ответ (1 предложение):"""
-        
-        else:
-            return ""
-
-        response = self.call_ollama_model(prompt, max_tokens=80, temperature=0.7)
-        return response.strip()
-
-    def generate_response(self, intent: str, query: str, found_recipes: List[Tuple[Dict[str, Any], float]]) -> str:
+    def generate_response(self, query: str, found_recipes: List[Tuple[Dict[str, Any], float]]) -> str:
         """Генерирует ответ"""
         self.last_search_results = found_recipes
 
-        # Используем Ollama для генерации ответов при общении
-        if intent in ["приветствие", "общение", "благодарность"]:
-            ollama_response = self.generate_ollama_response(intent, query)
-            if ollama_response:
-                return ollama_response
-
-        if intent == "прощание":
-            return "До свидания! Надеюсь, нашли что-то вкусное! 🍽️"
-
-        elif intent == "рекомендация":
-            if not found_recipes:
-                available_recipes = [r for r in self.recipes if r.get('title') not in self.session_state['previous_recipes']]
-                random_recipes = random.sample(available_recipes, min(5, len(available_recipes)))
-                self.last_search_results = [(r, 0.8) for r in random_recipes]
-                return "Вот несколько случайных рецептов:"
-
-        elif intent == "смена_темы":
-            if not found_recipes:
-                return "Больше нет рецептов для показа. Попробуйте новый поиск."
-
         if not found_recipes:
-            dish_names, ingredients = self.extract_keywords_with_ollama(query)
-            if dish_names or ingredients:
-                return f"К сожалению, не нашла рецептов с {', '.join(dish_names + ingredients)}. Попробуйте уточнить запрос."
+            search_terms = self.extract_search_terms(query)
+            if search_terms:
+                return f"Не нашла рецептов, содержащих: {', '.join(search_terms)}"
             else:
-                return "Извините, не поняла ваш запрос. Попробуйте ввести название блюда или ингредиенты."
+                return "Не нашла подходящих рецептов. Попробуйте другие слова."
 
-        if len(found_recipes) == 1 and found_recipes[0][1] > 0.8:
-            recipe, score = found_recipes[0]
-            self.last_shown_recipe = recipe.get('title')
-            self.session_state['previous_recipes'].append(recipe.get('title'))
-            return "🎯 Отлично! Нашла для вас идеальный рецепт:"
-        else:
-            total_results = len(self.session_state['all_search_results'])
-            current_page = self.session_state['current_page']
-            shown_count = len(found_recipes)
-            start_idx = current_page * 5 + 1
-            end_idx = start_idx + shown_count - 1
-            
-            return f"🍽️ Нашла {total_results} рецептов (показано {start_idx}-{end_idx}):"
+        # Всегда показываем список, даже если один рецепт
+        total_results = len(self.session_state['all_search_results'])
+        current_page = self.session_state['current_page']
+        shown_count = len(found_recipes)
+        start_idx = current_page * 5 + 1
+        end_idx = start_idx + shown_count - 1
+        
+        return f"Нашла {total_results} рецептов (показано {start_idx}-{end_idx}):"
 
     def format_recipe_response(self, recipe: Dict[str, Any]) -> str:
         """Форматирует полный рецепт"""
-        response = f"\n\n### 🍳 {recipe.get('title', 'Рецепт')}\n"
+        response = f"\n\n{recipe.get('title', 'Рецепт')}\n"
         response += "-" * 40 + "\n"
 
         if recipe.get('description'):
             response += f"{recipe['description']}\n\n"
 
         if recipe.get('temperature'):
-            response += f"🌡️ Температура: {recipe['temperature']}\n"
+            response += f"Температура: {recipe['temperature']}\n"
         if recipe.get('time'):
-            response += f"⏰ Время: {recipe['time']}\n"
+            response += f"Время: {recipe['time']}\n"
 
         if recipe.get('ingredients'):
-            response += "\n📦 **Ингредиенты:**\n"
+            response += "\nИнгредиенты:\n"
             for ingredient in recipe['ingredients']:
                 response += f"  - {ingredient}\n"
 
         if recipe.get('steps'):
-            response += "\n📝 **Приготовление:**\n"
+            response += "\nПриготовление:\n"
             for i, step in enumerate(recipe['steps'], 1):
                 clean_step = re.sub(r'[▪️️♨️🔥]', '', step).strip()
                 if clean_step:
                     response += f"  {i}. {clean_step}\n"
 
         if recipe.get('tags'):
-            response += f"\n🏷️ **Категории:** {', '.join(recipe['tags'])}\n"
+            response += f"\nКатегории: {', '.join(recipe['tags'])}\n"
 
         response += "\n" + "-" * 40
         return response
 
     def format_recipe_list(self, recipes: List[Tuple[Dict[str, Any], float]]) -> str:
-        """Форматирует список рецептов с инструкцией отказа"""
+        """Форматирует список рецептов"""
         if not recipes:
             return ""
 
-        if len(recipes) == 1 and recipes[0][1] > 0.8:
-            recipe, score = recipes[0]
-            self.last_shown_recipe = recipe.get('title')
-            self.session_state['previous_recipes'].append(recipe.get('title'))
-            return self.format_recipe_response(recipe)
-
+        # Если только один рецепт, все равно показываем список для выбора
         recipes_to_show = recipes
         self.session_state['waiting_for_selection'] = True
 
         response = []
         for i, (recipe, score) in enumerate(recipes_to_show, 1):
             title = recipe.get('title', 'Рецепт без названия')
-            time_info = f" (⏰ {recipe['time']})" if recipe.get('time') else ""
-            tags_info = f" [🏷️ {', '.join(recipe['tags'])}]" if recipe.get('tags') else ""
-            response.append(f"{i}. **{title}**{time_info}{tags_info}")
+            time_info = f" ({recipe['time']})" if recipe.get('time') else ""
+            tags_info = f" [{', '.join(recipe['tags'])}]" if recipe.get('tags') else ""
+            response.append(f"{i}. {title}{time_info}{tags_info}")
 
         total_results = len(self.session_state['all_search_results'])
         current_page = self.session_state['current_page']
         
-        pagination_info = f"\n\n📄 Страница {current_page + 1} из {((total_results - 1) // 5) + 1}"
-        
-        # ВАЖНО: Инструкция для отказа от выбора
-        navigation_info = "\n\n*Выберите номер рецепта 📋 или скажите 'другой рецепт' 🔄 для нового поиска*"
+        pagination_info = f"\n\nСтраница {current_page + 1} из {((total_results - 1) // 5) + 1}"
+        navigation_info = "\nУкажите номер рецепта (1, 2, 3... или первое, второе, третье...), название для выбора. Или напишите 'другой рецепт' для нового поиска."
         
         return "\n" + "\n".join(response) + pagination_info + navigation_info
 
@@ -586,51 +417,112 @@ class SmartRecipeBot:
         """Проверяет, является ли сообщение выбором из списка"""
         if not self.last_search_results or not self.session_state['waiting_for_selection']:
             return False
-        
-        # Проверяем отказ от выбора
-        if message.lower() in ['другой рецепт', 'другой', 'новый поиск', 'еще', 'дальше']:
-            return True
             
-        if message.isdigit():
-            number = int(message)
+        message_lower = message.lower().strip()
+        
+        # Игнорируем команды поиска при выборе из списка
+        search_commands = ['найди', 'грандшеф найди', 'грандшеф', 'поиск', 'ищи']
+        if any(message_lower.startswith(cmd) for cmd in search_commands):
+            return False
+            
+        # Убираем мешающие слова типа "давай", "покажи", "хочу" и т.д.
+        filter_words = ['давай', 'покажи', 'хочу', 'выбери', 'можно']
+        clean_message = message_lower
+        for word in filter_words:
+            clean_message = clean_message.replace(word, '').strip()
+        
+        # Если после очистки сообщение пустое, используем оригинальное
+        if not clean_message:
+            clean_message = message_lower
+            
+        # Проверяем номер (цифры)
+        if clean_message.isdigit():
+            number = int(clean_message)
+            return 1 <= number <= len(self.last_search_results)
+        
+        # Проверяем словесные обозначения номеров
+        number_words = {
+            'первое': 1, 'первый': 1, 'первую': 1, 'первой': 1,
+            'второе': 2, 'второй': 2, 'вторую': 2, 'второй': 2,
+            'третье': 3, 'третий': 3, 'третью': 3, 'третьей': 3,
+            'четвертое': 4, 'четвертый': 4, 'четвертую': 4, 'четвертой': 4,
+            'пятое': 5, 'пятый': 5, 'пятую': 5, 'пятой': 5,
+            'шестое': 6, 'шестой': 6, 'шестую': 6, 'шестой': 6,
+            'седьмое': 7, 'седьмой': 7, 'седьмую': 7, 'седьмой': 7,
+            'восьмое': 8, 'восьмой': 8, 'восьмую': 8, 'восьмой': 8,
+            'девятое': 9, 'девятый': 9, 'девятую': 9, 'девятой': 9,
+            'десятое': 10, 'десятый': 10, 'десятую': 10, 'десятой': 10
+        }
+        
+        if clean_message in number_words:
+            number = number_words[clean_message]
             return 1 <= number <= len(self.last_search_results)
             
-        message_lower = message.lower()
+        # Проверяем по названию (также с очисткой от мешающих слов)
         for recipe, score in self.last_search_results:
             title = recipe.get('title', '').lower()
-            if (message_lower in title or 
-                any(word in title for word in message_lower.split())):
+            
+            # Точное совпадение или частичное
+            if clean_message == title or clean_message in title:
                 return True
                 
         return False
 
     def select_recipe(self, selection: str) -> Optional[Dict[str, Any]]:
-        """Выбирает рецепт по номеру или названию (БЕЗ нейросети)"""
+        """Выбирает рецепт по номеру или названию"""
         if not self.last_search_results:
             return None
 
-        # Обработка отказа от выбора
-        if selection.lower() in ['другой рецепт', 'другой', 'новый поиск', 'еще', 'дальше']:
-            self.session_state['waiting_for_selection'] = False
-            self.session_state['all_search_results'] = []
-            self.last_search_results = []
-            return None  # Специальное значение для отказа
+        selection_lower = selection.lower().strip()
 
-        # Выбор по номеру (БЕЗ нейросети)
-        if selection.isdigit():
-            number = int(selection)
+        # Убираем мешающие слова типа "давай", "покажи", "хочу" и т.д.
+        filter_words = ['давай', 'покажи', 'хочу', 'выбери', 'можно']
+        clean_selection = selection_lower
+        for word in filter_words:
+            clean_selection = clean_selection.replace(word, '').strip()
+        
+        # Если после очистки сообщение пустое, используем оригинальное
+        if not clean_selection:
+            clean_selection = selection_lower
+
+        # Словарь словесных обозначений номеров
+        number_words = {
+            'первое': 1, 'первый': 1, 'первую': 1, 'первой': 1,
+            'второе': 2, 'второй': 2, 'вторую': 2, 'второй': 2,
+            'третье': 3, 'третий': 3, 'третью': 3, 'третьей': 3,
+            'четвертое': 4, 'четвертый': 4, 'четвертую': 4, 'четвертой': 4,
+            'пятое': 5, 'пятый': 5, 'пятую': 5, 'пятой': 5,
+            'шестое': 6, 'шестой': 6, 'шестую': 6, 'шестой': 6,
+            'седьмое': 7, 'седьмой': 7, 'седьмую': 7, 'седьмой': 7,
+            'восьмое': 8, 'восьмой': 8, 'восьмую': 8, 'восьмой': 8,
+            'девятое': 9, 'девятый': 9, 'девятую': 9, 'девятой': 9,
+            'десятое': 10, 'десятый': 10, 'десятую': 10, 'десятой': 10
+        }
+
+        # Выбор по номеру (цифры)
+        if clean_selection.isdigit():
+            number = int(clean_selection)
             if 1 <= number <= len(self.last_search_results):
                 recipe, score = self.last_search_results[number - 1]
                 self.session_state['previous_recipes'].append(recipe.get('title'))
                 self.session_state['waiting_for_selection'] = False
                 return recipe
 
-        # Выбор по названию (БЕЗ нейросети - простое сравнение строк)
-        selection_lower = selection.lower()
+        # Выбор по словесному номеру
+        if clean_selection in number_words:
+            number = number_words[clean_selection]
+            if 1 <= number <= len(self.last_search_results):
+                recipe, score = self.last_search_results[number - 1]
+                self.session_state['previous_recipes'].append(recipe.get('title'))
+                self.session_state['waiting_for_selection'] = False
+                return recipe
+
+        # Выбор по названию
         for recipe, score in self.last_search_results:
             title = recipe.get('title', '').lower()
-            if (selection_lower in title or 
-                any(word in title for word in selection_lower.split())):
+            
+            # Точное совпадение или частичное
+            if clean_selection == title or clean_selection in title:
                 self.session_state['previous_recipes'].append(recipe.get('title'))
                 self.session_state['waiting_for_selection'] = False
                 return recipe
@@ -642,85 +534,104 @@ class SmartRecipeBot:
         if not message.strip():
             return "Пожалуйста, опишите, что вы хотите приготовить."
 
-        # ШАГ 4: Обработка выбора из списка (БЕЗ нейросети)
+        message_lower = message.lower().strip()
+
+        # Выход из режима выбора по фразе "другой рецепт"
+        if self.session_state['waiting_for_selection'] and any(word in message_lower for word in ['другой', 'новый', 'искать', 'поиск', 'найди']):
+            self.session_state['waiting_for_selection'] = False
+            self.session_state['all_search_results'] = []
+            # Если начинается с команды поиска - выполняем поиск
+            if any(message_lower.startswith(cmd) for cmd in ['найди', 'грандшеф найди', 'грандшеф', 'поиск', 'ищи']):
+                clean_query = message_lower
+                for cmd in ['найди', 'грандшеф найди', 'грандшеф', 'поиск', 'ищи']:
+                    clean_query = clean_query.replace(cmd, '').strip()
+                
+                recipes = self.smart_search(clean_query)
+                if recipes:
+                    main_response = self.generate_response(clean_query, recipes)
+                    recipes_formatted = self.format_recipe_list(recipes)
+                    return f"{main_response}{recipes_formatted}"
+                else:
+                    return "Не нашла подходящих рецептов. Попробуйте другие слова."
+            else:
+                return "Хорошо, давайте поищем другой рецепт. Напишите что вы хотите приготовить."
+
+        # Если в режиме выбора - проверяем выбор
         if self.session_state['waiting_for_selection'] and self.is_selection_from_list(message):
             selected_recipe = self.select_recipe(message)
-            
-            # Пользователь отказался от выбора
-            if selected_recipe is None and message.lower() in ['другой рецепт', 'другой', 'новый поиск']:
-                self.session_state['waiting_for_selection'] = False
-                self.session_state['all_search_results'] = []
-                return "Хорошо! Что бы вы хотели приготовить вместо этого? 🍳"
-            
-            # Пользователь выбрал рецепт
             if selected_recipe:
                 self.last_shown_recipe = selected_recipe.get('title')
                 return self.format_recipe_response(selected_recipe)
             else:
-                return "Рецепт не найден. Выберите номер или название из списка, или скажите 'другой рецепт'."
+                return "Рецепт не найден. Выберите номер или название из списка."
 
-        # ШАГ 1-3: Анализ запроса и поиск (С нейросетью)
-        intent = self.classify_intent_ml(message)
+        # Простые команды
+        if message_lower in ['привет', 'здравствуйте', 'начать']:
+            return "Привет! Я ваш кулинарный помощник. Для поиска рецептов начните сообщение со слов: найди, грандшеф найди, или просто укажите что вы хотите приготовить."
+        
+        if message_lower in ['пока', 'выход', 'до свидания']:
+            return "До свидания! Приятного аппетита!"
 
-        if intent in ["приветствие", "прощание", "общение", "благодарность"]:
-            return self.generate_response(intent, message, [])
+        # Проверяем, содержит ли запрос команду для поиска
+        search_commands = ['найди', 'грандшеф найди', 'грандшеф', 'поиск', 'ищи']
+        has_search_command = any(message_lower.startswith(cmd) for cmd in search_commands)
+        
+        # Если нет команды поиска и не в режиме выбора - подсказка
+        if not has_search_command and not self.session_state['waiting_for_selection']:
+            return "Для поиска рецептов начните сообщение со слов: 'найди', 'грандшеф найди' или укажите что вы хотите приготовить."
 
-        # Используем нейросеть для анализа поискового запроса
-        recipes = self.smart_search(message)
+        # Убираем команды поиска из запроса для чистого анализа
+        clean_query = message_lower
+        for cmd in search_commands:
+            clean_query = clean_query.replace(cmd, '').strip()
 
-        main_response = self.generate_response(intent, message, recipes)
-        recipes_formatted = self.format_recipe_list(recipes)
-
-        return f"{main_response}{recipes_formatted}"
+        # Поиск рецептов
+        recipes = self.smart_search(clean_query)
+        if recipes:
+            main_response = self.generate_response(clean_query, recipes)
+            recipes_formatted = self.format_recipe_list(recipes)
+            return f"{main_response}{recipes_formatted}"
+        else:
+            return "Не нашла подходящих рецептов. Попробуйте другие слова."
 
     def run_chat(self):
         """Запускает интерактивный чат"""
-        print("\n" + "=" * 70)
-        print("🤖 УМНЫЙ ПОМОЩНИК РЕЦЕПТОВ С PURE ML + OLLAMA")
-        print("=" * 70)
-        print(f"📁 Загружено рецептов: {len(self.recipes)}")
-        print(f"🧠 Использую ML + Ollama модель: {self.ollama_model}")
-        print("🎯 Умный анализ запросов и поиск по рецептам")
-        print("\nПримеры:")
-        print("• 'Греческая мусака' - поиск по названию")
-        print("• 'Рецепт с гречкой и курицей' - поиск по ингредиентам") 
-        print("• 'Покажи еще' - следующая страница")
-        print("• '1' или 'название' - выбор рецепта")
-        print("=" * 70)
+        print("\n" + "=" * 60)
+        print("КУЛИНАРНЫЙ ПОМОЩНИК - УМНЫЙ ПОИСК РЕЦЕПТОВ")
+        print("=" * 60)
+        print(f"Загружено рецептов: {len(self.recipes)}")
+        if MORPH_AVAILABLE:
+            print("Использую морфологический анализ для поиска")
+            print("Понимает разные формы слов: курицу, курицей, курочка -> курица")
+        print("\nИНСТРУКЦИЯ:")
+        print("1. Для поиска начните сообщение с: 'найди', 'грандшеф найди'")
+        print("2. Примеры: 'найди курицу с картошкой', 'грандшеф найди шоколадный торт'")
+        print("3. При выборе из списка можно:")
+        print("   - Указать номер рецепта (1, 2, 3...)")
+        print("   - Написать название рецепта (без 'найди')")
+        print("   - Написать 'другой рецепт' или 'найди ...' для нового поиска")
+        print("4. Для продолжения поиска: 'покажи еще'")
+        print("=" * 60)
+        print("Начните с команды 'найди' и укажите что хотите приготовить...")
 
         while True:
             try:
-                user_input = input("\n👤 Вы: ").strip()
+                user_input = input("\nВы: ").strip()
 
                 if user_input.lower() in ['пока', 'выход', 'до свидания', 'закончить']:
-                    print(f"\n🤖 Бот: {self.generate_response('прощание', user_input, [])}")
+                    print(f"\nБот: До свидания! Приятного аппетита!")
                     break
 
                 response = self.process_message(user_input)
-                print(f"\n🤖 Бот: {response}")
+                print(f"\nБот: {response}")
 
             except KeyboardInterrupt:
-                print(f"\n🤖 Бот: {self.generate_response('прощание', 'пока', [])}")
+                print(f"\nБот: До свидания! Приятного аппетита!")
                 break
             except Exception as e:
-                print(f"\n🤖 Бот: Извините, произошла ошибка. Попробуйте еще раз.")
+                print(f"\nБот: Извините, произошла ошибка. Попробуйте еще раз.")
                 logging.error(f"Error: {e}")
 
 if __name__ == "__main__":
-    # Проверяем доступные модели Ollama
-    try:
-        response = requests.get("http://localhost:11434/api/tags", timeout=30)
-        models = [model['name'] for model in response.json().get('models', [])]
-        print("Доступные модели Ollama:", models)
-        
-        selected_model = "llama3.2:3b"
-        
-        print(f"Используем модель: {selected_model}")
-        bot = SmartRecipeBot("recipes.json", selected_model)
-        
-    except Exception as e:
-        print(f"❌ Ошибка подключения к Ollama: {e}")
-        print("Запустите Ollama: ollama serve")
-        exit(1)
-        
+    bot = SmartRecipeBot("recipes.json")
     bot.run_chat()
