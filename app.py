@@ -24,7 +24,53 @@ START_MESSAGE = """Привет! Я ваш кулинарный помощник
 
 Что хотите приготовить?"""
 
-def create_alice_response(text, tts=None, buttons=None, end_session=False):
+def split_long_response(text):
+    """Разбивает длинный текст на части, если превышает лимит 1024 символа"""
+    if len(text) <= 1024:
+        return [text]
+    
+    # Пытаемся разбить по секциям рецепта
+    parts = []
+    
+    # Ищем разделители для ингредиентов и шагов
+    ingredients_marker = "Ингредиенты:"
+    steps_marker = "Приготовление:"
+    
+    if ingredients_marker in text and steps_marker in text:
+        # Разделяем на ингредиенты и шаги
+        ingredients_part = text.split(steps_marker)[0]
+        steps_part = steps_marker + text.split(steps_marker)[1]
+        
+        # Если каждая часть все еще слишком длинная, разбиваем дальше
+        if len(ingredients_part) > 1024:
+            # Разбиваем ингредиенты на части по 1000 символов
+            for i in range(0, len(ingredients_part), 1000):
+                part = ingredients_part[i:i+1000]
+                if i == 0:
+                    parts.append(part)
+                else:
+                    parts.append("(продолжение)\n" + part)
+        else:
+            parts.append(ingredients_part)
+            
+        if len(steps_part) > 1024:
+            # Разбиваем шаги на части по 1000 символов
+            for i in range(0, len(steps_part), 1000):
+                part = steps_part[i:i+1000]
+                if i == 0:
+                    parts.append(part)
+                else:
+                    parts.append("(продолжение шагов)\n" + part)
+        else:
+            parts.append(steps_part)
+    else:
+        # Простое разбиение на части по 1000 символов
+        for i in range(0, len(text), 1000):
+            parts.append(text[i:i+1000])
+    
+    return parts
+
+def create_alice_response(text, tts=None, buttons=None, end_session=False, session_state=None):
     """Создает ответ для Яндекс Алисы"""
     response = {
         "response": {
@@ -39,6 +85,9 @@ def create_alice_response(text, tts=None, buttons=None, end_session=False):
     
     if buttons:
         response["response"]["buttons"] = buttons
+    
+    if session_state:
+        response["session_state"] = session_state
     
     return response
 
@@ -58,6 +107,7 @@ def webhook():
         
         request_data = data['request']
         session = data.get('session', {})
+        session_state = data.get('state', {}).get('session', {})
         
         # Обрабатываем начало сессии
         if request_data.get('type') == 'SimpleUtterance' and 'марку' in request_data.get('command', '').lower():
@@ -102,7 +152,38 @@ def webhook():
         # Обрабатываем сообщение через бота
         bot_response = bot.process_message(user_message)
         
-        # Создаем кнопки для навигации
+        # Проверяем длину ответа и разбиваем при необходимости
+        if len(bot_response) > 1024:
+            parts = split_long_response(bot_response)
+            
+            # Если ответ разбит на части, отправляем первую часть
+            # и сохраняем остальные в состоянии сессии
+            if len(parts) > 1:
+                first_part = parts[0]
+                remaining_parts = parts[1:]
+                
+                # Сохраняем оставшиеся части в состоянии сессии
+                session_state = {
+                    "response_parts": remaining_parts,
+                    "current_part": 0
+                }
+                
+                # Добавляем подсказку для продолжения
+                first_part += "\n\n(Продолжение следует... Скажите 'далее' для чтения следующей части)"
+                
+                buttons = [
+                    {"title": "Далее", "hide": True},
+                    {"title": "Другой рецепт", "hide": True},
+                    {"title": "Помощь", "hide": True}
+                ]
+                
+                return jsonify(create_alice_response(
+                    first_part,
+                    buttons=buttons,
+                    session_state=session_state
+                ))
+        
+        # Обычная обработка для коротких ответов
         buttons = []
         if "Нашла" in bot_response and "рецептов" in bot_response:
             # Если показан список рецептов
@@ -116,6 +197,13 @@ def webhook():
                 {"title": "Первое", "hide": True},
                 {"title": "Второе", "hide": True},
                 {"title": "Другой рецепт", "hide": True}
+            ])
+        elif session_state.get('response_parts'):
+            # Если есть продолжение ответа
+            buttons.extend([
+                {"title": "Далее", "hide": True},
+                {"title": "Другой рецепт", "hide": True},
+                {"title": "Помощь", "hide": True}
             ])
         else:
             # Обычное состояние
@@ -148,7 +236,7 @@ if __name__ == '__main__':
         
         app.run(
             host='0.0.0.0',
-            port=8443,
+            port=5000,
             ssl_context=context,
             debug=False
         )
