@@ -149,6 +149,41 @@ def webhook():
                 ]
             ))
         
+        # Обрабатываем команду "далее" для продолжения чтения рецепта
+        user_message_lower = user_message.lower()
+        if user_message_lower in ['далее', 'продолжи', 'следующая часть'] and session_state.get('response_parts'):
+            # Получаем следующую часть рецепта
+            remaining_parts = session_state['response_parts']
+            if remaining_parts:
+                next_part = remaining_parts[0]
+                new_remaining_parts = remaining_parts[1:]
+                
+                # Обновляем состояние сессии
+                new_session_state = {
+                    "response_parts": new_remaining_parts,
+                    "current_part": session_state.get('current_part', 0) + 1
+                }
+                
+                # Добавляем подсказку для продолжения, если есть еще части
+                if new_remaining_parts:
+                    next_part += "\n\n(Продолжение следует... Скажите 'далее' для чтения следующей части)"
+                    buttons = [
+                        {"title": "Далее", "hide": True},
+                        {"title": "Другой рецепт", "hide": True},
+                        {"title": "Помощь", "hide": True}
+                    ]
+                else:
+                    buttons = [
+                        {"title": "Другой рецепт", "hide": True},
+                        {"title": "Помощь", "hide": True}
+                    ]
+                
+                return jsonify(create_alice_response(
+                    next_part,
+                    buttons=buttons,
+                    session_state=new_session_state
+                ))
+        
         # Обрабатываем сообщение через бота
         bot_response = bot.process_message(user_message)
         
