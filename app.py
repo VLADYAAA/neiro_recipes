@@ -107,7 +107,10 @@ def webhook():
         
         request_data = data['request']
         session = data.get('session', {})
-        session_state = data.get('state', {}).get('session', {})
+        
+        # Правильно получаем состояние сессии
+        state = data.get('state', {})
+        session_state = state.get('session', {}) if state else {}
         
         # Обрабатываем начало сессии
         if request_data.get('type') == 'SimpleUtterance' and 'марку' in request_data.get('command', '').lower():
@@ -115,8 +118,8 @@ def webhook():
                 "Это кулинарный помощник! " + START_MESSAGE,
                 buttons=[
                     {"title": "Найди рецепт пиццы", "hide": True},
-                    {"title": "Блюда с курицей", "hide": True},
-                    {"title": "Десерты", "hide": True}
+                    {"title": "Найди блюда с курицей", "hide": True},
+                    {"title": "Найди десерты", "hide": True}
                 ]
             ))
         
@@ -127,8 +130,8 @@ def webhook():
                 START_MESSAGE,
                 buttons=[
                     {"title": "Найди рецепт пиццы", "hide": True},
-                    {"title": "Блюда с курицей", "hide": True},
-                    {"title": "Десерты", "hide": True}
+                    {"title": "Найди блюда с курицей", "hide": True},
+                    {"title": "Найди десерты", "hide": True}
                 ]
             ))
         
@@ -144,45 +147,85 @@ def webhook():
                 "Что вы хотите приготовить?",
                 buttons=[
                     {"title": "Найди рецепт пиццы", "hide": True},
-                    {"title": "Блюда с курицей", "hide": True},
-                    {"title": "Помощь", "hide": True}
+                    {"title": "Найди блюда с курицей", "hide": True},
+                    {"title": "Найди помощь", "hide": True}
                 ]
             ))
         
-        # Обрабатываем команду "далее" для продолжения чтения рецепта
         user_message_lower = user_message.lower()
-        if user_message_lower in ['далее', 'продолжи', 'следующая часть'] and session_state.get('response_parts'):
-            # Получаем следующую часть рецепта
-            remaining_parts = session_state['response_parts']
-            if remaining_parts:
-                next_part = remaining_parts[0]
-                new_remaining_parts = remaining_parts[1:]
-                
-                # Обновляем состояние сессии
-                new_session_state = {
-                    "response_parts": new_remaining_parts,
-                    "current_part": session_state.get('current_part', 0) + 1
-                }
-                
-                # Добавляем подсказку для продолжения, если есть еще части
-                if new_remaining_parts:
-                    next_part += "\n\n(Продолжение следует... Скажите 'далее' для чтения следующей части)"
-                    buttons = [
-                        {"title": "Далее", "hide": True},
-                        {"title": "Другой рецепт", "hide": True},
-                        {"title": "Помощь", "hide": True}
-                    ]
-                else:
-                    buttons = [
-                        {"title": "Другой рецепт", "hide": True},
-                        {"title": "Помощь", "hide": True}
-                    ]
-                
+        
+        # Обрабатываем команду "далее" для продолжения чтения рецепта
+        if user_message_lower in ['далее', 'продолжи', 'следующая часть']:
+            if session_state.get('response_parts'):
+                # Получаем следующую часть рецепта
+                remaining_parts = session_state['response_parts']
+                if remaining_parts:
+                    next_part = remaining_parts[0]
+                    new_remaining_parts = remaining_parts[1:]
+                    
+                    # Обновляем состояние сессии
+                    new_session_state = {
+                        "response_parts": new_remaining_parts,
+                        "current_part": session_state.get('current_part', 0) + 1
+                    }
+                    
+                    # Добавляем подсказку для продолжения, если есть еще части
+                    if new_remaining_parts:
+                        next_part += "\n\n(Продолжение следует... Скажите 'далее' для чтения следующей части)"
+                        buttons = [
+                            {"title": "Далее", "hide": True},
+                            {"title": "Другой рецепт", "hide": True},
+                            {"title": "Помощь", "hide": True}
+                        ]
+                    else:
+                        buttons = [
+                            {"title": "Другой рецепт", "hide": True},
+                            {"title": "Помощь", "hide": True}
+                        ]
+                    
+                    return jsonify(create_alice_response(
+                        next_part,
+                        buttons=buttons,
+                        session_state=new_session_state
+                    ))
+            else:
                 return jsonify(create_alice_response(
-                    next_part,
-                    buttons=buttons,
-                    session_state=new_session_state
+                    "Больше нет частей для продолжения. Начните новый поиск.",
+                    buttons=[
+                        {"title": "Найди рецепт пиццы", "hide": True},
+                        {"title": "Найди блюда с курицей", "hide": True},
+                        {"title": "Помощь", "hide": True}
+                    ]
                 ))
+        
+        # Обрабатываем команду "покажи еще" для пагинации
+        if user_message_lower in ['покажи еще', 'еще', 'дальше', 'следующие']:
+            # Используем специальную команду для пагинации
+            bot_response = bot.process_message("покажи еще")
+            
+            buttons = []
+            if "Нашла" in bot_response and "рецептов" in bot_response:
+                buttons.extend([
+                    {"title": "Покажи еще", "hide": True},
+                    {"title": "Другой рецепт", "hide": True}
+                ])
+            elif "Укажите номер рецепта" in bot_response:
+                buttons.extend([
+                    {"title": "Первое", "hide": True},
+                    {"title": "Второе", "hide": True},
+                    {"title": "Другой рецепт", "hide": True}
+                ])
+            else:
+                buttons.extend([
+                    {"title": "Найди рецепт пиццы", "hide": True},
+                    {"title": "Найди блюда с курицей", "hide": True},
+                    {"title": "Помощь", "hide": True}
+                ])
+            
+            return jsonify(create_alice_response(
+                bot_response,
+                buttons=buttons
+            ))
         
         # Обрабатываем сообщение через бота
         bot_response = bot.process_message(user_message)
@@ -198,7 +241,7 @@ def webhook():
                 remaining_parts = parts[1:]
                 
                 # Сохраняем оставшиеся части в состоянии сессии
-                session_state = {
+                new_session_state = {
                     "response_parts": remaining_parts,
                     "current_part": 0
                 }
@@ -215,7 +258,7 @@ def webhook():
                 return jsonify(create_alice_response(
                     first_part,
                     buttons=buttons,
-                    session_state=session_state
+                    session_state=new_session_state
                 ))
         
         # Обычная обработка для коротких ответов
@@ -233,18 +276,11 @@ def webhook():
                 {"title": "Второе", "hide": True},
                 {"title": "Другой рецепт", "hide": True}
             ])
-        elif session_state.get('response_parts'):
-            # Если есть продолжение ответа
-            buttons.extend([
-                {"title": "Далее", "hide": True},
-                {"title": "Другой рецепт", "hide": True},
-                {"title": "Помощь", "hide": True}
-            ])
         else:
             # Обычное состояние
             buttons.extend([
                 {"title": "Найди рецепт пиццы", "hide": True},
-                {"title": "Блюда с курицей", "hide": True},
+                {"title": "Найди блюда с курицей", "hide": True},
                 {"title": "Помощь", "hide": True}
             ])
         
