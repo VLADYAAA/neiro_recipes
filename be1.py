@@ -361,7 +361,6 @@ class SmartRecipeBot:
     def format_recipe_response(self, recipe: Dict[str, Any]) -> str:
         """Форматирует полный рецепт"""
         response = f"\n\n{recipe.get('title', 'Рецепт')}\n"
-        response += "-" * 40 + "\n"
 
         if recipe.get('description'):
             response += f"{recipe['description']}\n\n"
@@ -385,8 +384,6 @@ class SmartRecipeBot:
 
         if recipe.get('tags'):
             response += f"\nКатегории: {', '.join(recipe['tags'])}\n"
-
-        response += "\n" + "-" * 40
         return response
 
     def format_recipe_list(self, recipes: List[Tuple[Dict[str, Any], float]]) -> str:

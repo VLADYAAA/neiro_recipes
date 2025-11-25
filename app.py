@@ -2,6 +2,8 @@ from flask import Flask, request, jsonify
 import logging
 from be1 import SmartRecipeBot
 import ssl
+import json
+import re
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -9,6 +11,9 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 bot = SmartRecipeBot("recipes.json")
+
+# Временное хранилище для частей рецептов (в памяти)
+recipe_parts_store = {}
 
 # Стартовое сообщение с инструкцией
 START_MESSAGE = """Привет! Я ваш кулинарный помощник. 
@@ -24,54 +29,96 @@ START_MESSAGE = """Привет! Я ваш кулинарный помощник
 
 Что хотите приготовить?"""
 
+def split_by_sentences(text, max_length=1000):
+    """Разбивает текст на части по предложениям, не превышая max_length"""
+    if len(text) <= max_length:
+        return [text]
+    
+    # Разделяем текст на предложения, но игнорируем точки после цифр (например, "1.")
+    # Используем негативный просмотр назад, чтобы исключить цифры перед точкой
+    sentences = re.split(r'(?<!\d)\.\s+(?=[А-ЯA-Z])|\!\s+|\?\s+', text)
+    
+    parts = []
+    current_part = ""
+    
+    for sentence in sentences:
+        # Восстанавливаем знак препинания в конце предложения
+        # Находим какой знак был использован для разделения
+        if current_part:
+            # Добавляем точку к предыдущему предложению (кроме первого)
+            current_part += "."
+        
+        # Если добавление следующего предложения не превысит лимит
+        if len(current_part) + len(sentence) + 1 <= max_length:
+            if current_part:
+                current_part += " " + sentence
+            else:
+                current_part = sentence
+        else:
+            # Если текущая часть не пустая, сохраняем ее
+            if current_part:
+                parts.append(current_part.strip())
+            
+            # Если одно предложение само по себе длиннее max_length,
+            # разбиваем его по словам
+            if len(sentence) > max_length:
+                words = sentence.split()
+                current_part = ""
+                for word in words:
+                    if len(current_part) + len(word) + 1 <= max_length:
+                        if current_part:
+                            current_part += " " + word
+                        else:
+                            current_part = word
+                    else:
+                        if current_part:
+                            parts.append(current_part.strip())
+                        current_part = word
+            else:
+                current_part = sentence
+    
+    # Добавляем последнюю часть
+    if current_part:
+        parts.append(current_part.strip())
+    
+    return parts
 def split_long_response(text):
-    """Разбивает длинный текст на части, если превышает лимит 1024 символа"""
+    """Разбивает длинный текст на части по предложениям"""
     if len(text) <= 1024:
         return [text]
     
-    # Пытаемся разбить по секциям рецепта
-    parts = []
+    # Сначала пробуем разбить по предложениям
+    parts = split_by_sentences(text, 1000)
     
-    # Ищем разделители для ингредиентов и шагов
-    ingredients_marker = "Ингредиенты:"
-    steps_marker = "Приготовление:"
-    
-    if ingredients_marker in text and steps_marker in text:
-        # Разделяем на ингредиенты и шаги
-        ingredients_part = text.split(steps_marker)[0]
-        steps_part = steps_marker + text.split(steps_marker)[1]
-        
-        # Если каждая часть все еще слишком длинная, разбиваем дальше
-        if len(ingredients_part) > 1024:
-            # Разбиваем ингредиенты на части по 1000 символов
-            for i in range(0, len(ingredients_part), 1000):
-                part = ingredients_part[i:i+1000]
-                if i == 0:
-                    parts.append(part)
+    # Если все равно есть слишком длинные части, разбиваем принудительно
+    final_parts = []
+    for part in parts:
+        if len(part) > 1024:
+            # Принудительно разбиваем на части по 1000 символов, но стараясь по словам
+            words = part.split()
+            current_chunk = ""
+            for word in words:
+                if len(current_chunk) + len(word) + 1 <= 1000:
+                    if current_chunk:
+                        current_chunk += " " + word
+                    else:
+                        current_chunk = word
                 else:
-                    parts.append("(продолжение)\n" + part)
+                    if current_chunk:
+                        final_parts.append(current_chunk.strip())
+                    current_chunk = word
+            if current_chunk:
+                final_parts.append(current_chunk.strip())
         else:
-            parts.append(ingredients_part)
-            
-        if len(steps_part) > 1024:
-            # Разбиваем шаги на части по 1000 символов
-            for i in range(0, len(steps_part), 1000):
-                part = steps_part[i:i+1000]
-                if i == 0:
-                    parts.append(part)
-                else:
-                    parts.append("(продолжение шагов)\n" + part)
-        else:
-            parts.append(steps_part)
-    else:
-        # Простое разбиение на части по 1000 символов
-        for i in range(0, len(text), 1000):
-            parts.append(text[i:i+1000])
+            final_parts.append(part)
     
-    return parts
+    return final_parts
 
 def create_alice_response(text, tts=None, buttons=None, end_session=False, session_state=None):
-    """Создает ответ для Яндекс Алисы"""
+    """Создает ответ для Яндекс Алисы с гарантированной длиной до 1024 символов"""
+    # ГАРАНТИРУЕМ что текст не превышает 1024 символа
+    text = text[:1024]
+    
     response = {
         "response": {
             "text": text,
@@ -107,10 +154,13 @@ def webhook():
         
         request_data = data['request']
         session = data.get('session', {})
+        session_id = session.get('session_id', 'default')
         
-        # Правильно получаем состояние сессии
+        # Получаем состояние сессии
         state = data.get('state', {})
         session_state = state.get('session', {}) if state else {}
+        
+        logger.info(f"Session ID: {session_id}")
         
         # Обрабатываем начало сессии
         if request_data.get('type') == 'SimpleUtterance' and 'марку' in request_data.get('command', '').lower():
@@ -126,6 +176,10 @@ def webhook():
         # Новый сеанс или команда "Помощь"
         if (session.get('new') or 
             request_data.get('command', '').lower() in ['помощь', 'что ты умеешь', 'help']):
+            # Очищаем сохраненные части при новом сеансе
+            if session_id in recipe_parts_store:
+                del recipe_parts_store[session_id]
+                
             return jsonify(create_alice_response(
                 START_MESSAGE,
                 buttons=[
@@ -137,6 +191,9 @@ def webhook():
         
         # Выход
         if request_data.get('command', '').lower() in ['пока', 'выход', 'закончить']:
+            # Очищаем сохраненные части при выходе
+            if session_id in recipe_parts_store:
+                del recipe_parts_store[session_id]
             return jsonify(create_alice_response("До свидания! Приятного аппетита!", end_session=True))
         
         # Обрабатываем команду пользователя
@@ -154,54 +211,100 @@ def webhook():
         
         user_message_lower = user_message.lower()
         
+        # Обрабатываем команду "другой рецепт" - сбрасываем состояние
+        if user_message_lower in ['другой рецепт', 'новый поиск', 'сброс']:
+            # Очищаем сохраненные части
+            if session_id in recipe_parts_store:
+                del recipe_parts_store[session_id]
+            
+            return jsonify(create_alice_response(
+                "Хорошо, начинаем новый поиск. Что вы хотите приготовить?",
+                buttons=[
+                    {"title": "Найди рецепт пиццы", "hide": True},
+                    {"title": "Найди блюда с курицей", "hide": True},
+                    {"title": "Помощь", "hide": True}
+                ]
+            ))
+        
         # Обрабатываем команду "далее" для продолжения чтения рецепта
         if user_message_lower in ['далее', 'продолжи', 'следующая часть']:
-            if session_state.get('response_parts'):
-                # Получаем следующую часть рецепта
-                remaining_parts = session_state['response_parts']
+            logger.info(f"Processing 'next' command for session: {session_id}")
+            
+            # Проверяем есть ли сохраненные части для этой сессии
+            if session_id in recipe_parts_store and recipe_parts_store[session_id]:
+                remaining_parts = recipe_parts_store[session_id]
+                logger.info(f"Found {len(remaining_parts)} remaining parts")
+                
                 if remaining_parts:
                     next_part = remaining_parts[0]
                     new_remaining_parts = remaining_parts[1:]
                     
-                    # Обновляем состояние сессии
-                    new_session_state = {
-                        "response_parts": new_remaining_parts,
-                        "current_part": session_state.get('current_part', 0) + 1
-                    }
+                    # Обновляем хранилище
+                    recipe_parts_store[session_id] = new_remaining_parts
                     
                     # Добавляем подсказку для продолжения, если есть еще части
                     if new_remaining_parts:
-                        next_part += "\n\n(Продолжение следует... Скажите 'далее' для чтения следующей части)"
+                        # Обрезаем часть и добавляем короткое сообщение
+                        if len(next_part) > 1000:
+                            next_part = next_part[:1000]
+                        next_part += "\n\n(Скажите 'далее' для продолжения)"
                         buttons = [
                             {"title": "Далее", "hide": True},
                             {"title": "Другой рецепт", "hide": True},
                             {"title": "Помощь", "hide": True}
                         ]
                     else:
+                        # Последняя часть
+                        if len(next_part) > 1000:
+                            next_part = next_part[:1000]
+                        next_part += "\n\nПриятного аппетита"
                         buttons = [
                             {"title": "Другой рецепт", "hide": True},
                             {"title": "Помощь", "hide": True}
                         ]
                     
+                    logger.info(f"Sending part, remaining: {len(new_remaining_parts)}")
+                    
                     return jsonify(create_alice_response(
                         next_part,
-                        buttons=buttons,
-                        session_state=new_session_state
+                        buttons=buttons
                     ))
-            else:
-                return jsonify(create_alice_response(
-                    "Больше нет частей для продолжения. Начните новый поиск.",
-                    buttons=[
-                        {"title": "Найди рецепт пиццы", "hide": True},
-                        {"title": "Найди блюда с курицей", "hide": True},
-                        {"title": "Помощь", "hide": True}
-                    ]
-                ))
+            
+            # Если частей нет
+            return jsonify(create_alice_response(
+                "Больше нет частей для продолжения. Начните новый поиск.",
+                buttons=[
+                    {"title": "Найди рецепт пиццы", "hide": True},
+                    {"title": "Найди блюда с курицей", "hide": True},
+                    {"title": "Помощь", "hide": True}
+                ]
+            ))
         
         # Обрабатываем команду "покажи еще" для пагинации
         if user_message_lower in ['покажи еще', 'еще', 'дальше', 'следующие']:
             # Используем специальную команду для пагинации
             bot_response = bot.process_message("покажи еще")
+            
+            # ВАЖНО: Проверяем длину ответа даже для пагинации
+            if len(bot_response) > 1024:
+                parts = split_long_response(bot_response)
+                if len(parts) > 1:
+                    first_part = parts[0]
+                    remaining_parts = parts[1:]
+                    recipe_parts_store[session_id] = remaining_parts
+                    
+                    # Обрезаем и добавляем короткое сообщение
+                    if len(first_part) > 1000:
+                        first_part = first_part[:1000]
+                    first_part += "\n\n(Скажите 'далее' для продолжения)"
+                    
+                    return jsonify(create_alice_response(
+                        first_part,
+                        buttons=[
+                            {"title": "Далее", "hide": True},
+                            {"title": "Другой рецепт", "hide": True}
+                        ]
+                    ))
             
             buttons = []
             if "Нашла" in bot_response and "рецептов" in bot_response:
@@ -229,25 +332,26 @@ def webhook():
         
         # Обрабатываем сообщение через бота
         bot_response = bot.process_message(user_message)
+        logger.info(f"Bot response length: {len(bot_response)}")
         
-        # Проверяем длину ответа и разбиваем при необходимости
+        # ВАЖНО: Проверяем длину ВСЕХ ответов от бота, включая выбор рецепта по номеру
         if len(bot_response) > 1024:
             parts = split_long_response(bot_response)
+            logger.info(f"Split into {len(parts)} parts")
             
             # Если ответ разбит на части, отправляем первую часть
-            # и сохраняем остальные в состоянии сессии
+            # и сохраняем остальные в нашем хранилище
             if len(parts) > 1:
                 first_part = parts[0]
                 remaining_parts = parts[1:]
                 
-                # Сохраняем оставшиеся части в состоянии сессии
-                new_session_state = {
-                    "response_parts": remaining_parts,
-                    "current_part": 0
-                }
+                # Сохраняем оставшиеся части в хранилище
+                recipe_parts_store[session_id] = remaining_parts
                 
-                # Добавляем подсказку для продолжения
-                first_part += "\n\n(Продолжение следует... Скажите 'далее' для чтения следующей части)"
+                # Обрезаем первую часть и добавляем подсказку
+                if len(first_part) > 1000:
+                    first_part = first_part[:1000]
+                first_part += "\n\n(Скажите 'далее' для продолжения)"
                 
                 buttons = [
                     {"title": "Далее", "hide": True},
@@ -255,10 +359,11 @@ def webhook():
                     {"title": "Помощь", "hide": True}
                 ]
                 
+                logger.info(f"Saving {len(remaining_parts)} remaining parts for session: {session_id}")
+                
                 return jsonify(create_alice_response(
                     first_part,
-                    buttons=buttons,
-                    session_state=new_session_state
+                    buttons=buttons
                 ))
         
         # Обычная обработка для коротких ответов
@@ -274,13 +379,13 @@ def webhook():
             buttons.extend([
                 {"title": "Первое", "hide": True},
                 {"title": "Второе", "hide": True},
+                {"title": "Третье", "hide": True},
                 {"title": "Другой рецепт", "hide": True}
             ])
         else:
-            # Обычное состояние
+            # Обычное состояние (полный рецепт или другой ответ)
             buttons.extend([
-                {"title": "Найди рецепт пиццы", "hide": True},
-                {"title": "Найди блюда с курицей", "hide": True},
+                {"title": "Другой рецепт", "hide": True},
                 {"title": "Помощь", "hide": True}
             ])
         
