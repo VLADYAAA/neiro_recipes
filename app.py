@@ -1,16 +1,51 @@
 from flask import Flask, request, jsonify
 import logging
-from be1 import SmartRecipeBot
+from be11 import SmartRecipeBot
 import ssl
 import json
 import re
+import os
+import time
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-bot = SmartRecipeBot("recipes.json")
+
+class AutoReloadRecipeBot:
+    def __init__(self, recipe_file):
+        self.recipe_file = recipe_file
+        self.bot = None
+        self.last_modified = 0
+        self.load_recipes()
+    
+    def load_recipes(self):
+        """Загружает или перезагружает рецепты если файл изменился"""
+        try:
+            if os.path.exists(self.recipe_file):
+                current_modified = os.path.getmtime(self.recipe_file)
+                if current_modified > self.last_modified or self.bot is None:
+                    self.bot = SmartRecipeBot(self.recipe_file)
+                    self.last_modified = current_modified
+                    logger.info("Recipes loaded/reloaded successfully")
+                    return True
+            else:
+                logger.error(f"Recipe file {self.recipe_file} not found")
+        except Exception as e:
+            logger.error(f"Error loading recipes: {e}")
+        return False
+    
+    def process_message(self, message):
+        """Проверяет актуальность данных перед обработкой"""
+        self.load_recipes()
+        if self.bot:
+            return self.bot.process_message(message)
+        else:
+            return "Извините, не удалось загрузить рецепты. Проверьте файл с рецептами."
+
+# Инициализируем бота с автоперезагрузкой
+bot = AutoReloadRecipeBot("recipes.json")
 
 # Временное хранилище для частей рецептов (в памяти)
 recipe_parts_store = {}
@@ -82,6 +117,7 @@ def split_by_sentences(text, max_length=1000):
         parts.append(current_part.strip())
     
     return parts
+
 def split_long_response(text):
     """Разбивает длинный текст на части по предложениям"""
     if len(text) <= 1024:
@@ -141,6 +177,18 @@ def create_alice_response(text, tts=None, buttons=None, end_session=False, sessi
 @app.route('/')
 def index():
     return "Кулинарный помощник для Яндекс Алисы работает!"
+
+@app.route('/reload-recipes', methods=['POST'])
+def reload_recipes():
+    """Принудительная перезагрузка рецептов"""
+    try:
+        if bot.load_recipes():
+            return jsonify({"status": "success", "message": "Recipes reloaded successfully"})
+        else:
+            return jsonify({"status": "error", "message": "Failed to reload recipes"}), 500
+    except Exception as e:
+        logger.error(f"Error reloading recipes: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -312,12 +360,7 @@ def webhook():
                     {"title": "Покажи еще", "hide": True},
                     {"title": "Другой рецепт", "hide": True}
                 ])
-            elif "Укажите номер рецепта" in bot_response:
-                buttons.extend([
-                    {"title": "Первое", "hide": True},
-                    {"title": "Второе", "hide": True},
-                    {"title": "Другой рецепт", "hide": True}
-                ])
+            
             else:
                 buttons.extend([
                     {"title": "Найди рецепт пиццы", "hide": True},
@@ -374,14 +417,7 @@ def webhook():
                 {"title": "Покажи еще", "hide": True},
                 {"title": "Другой рецепт", "hide": True}
             ])
-        elif "Укажите номер рецепта" in bot_response:
-            # Если нужно выбрать из списка
-            buttons.extend([
-                {"title": "Первое", "hide": True},
-                {"title": "Второе", "hide": True},
-                {"title": "Третье", "hide": True},
-                {"title": "Другой рецепт", "hide": True}
-            ])
+        
         else:
             # Обычное состояние (полный рецепт или другой ответ)
             buttons.extend([
