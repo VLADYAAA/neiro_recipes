@@ -4,7 +4,28 @@ import os
 from typing import Dict, List, Any, Optional, Tuple
 import logging
 import random
-
+NUMBER_WORDS = {
+    'первое': 1, 'первый': 1, 'первую': 1, 'первой': 1,
+    'второе': 2, 'второй': 2, 'вторую': 2, 'второй': 2,
+    'третье': 3, 'третий': 3, 'третью': 3, 'третьей': 3,
+    'четвертое': 4, 'четвертый': 4, 'четвертую': 4, 'четвертой': 4,
+    'пятое': 5, 'пятый': 5, 'пятую': 5, 'пятой': 5,
+    'шестое': 6, 'шестой': 6, 'шестую': 6, 'шестой': 6,
+    'седьмое': 7, 'седьмой': 7, 'седьмую': 7, 'седьмой': 7,
+    'восьмое': 8, 'восьмой': 8, 'восьмую': 8, 'восьмой': 8,
+    'девятое': 9, 'девятый': 9, 'девятую': 9, 'девятой': 9,
+    'десятое': 10, 'десятый': 10, 'десятую': 10, 'десятой': 10,
+    'одиннадцатое': 11, 'одиннадцатый': 11, 'одиннадцатую': 11, 'одиннадцатой': 11,
+    'двенадцатое': 12, 'двенадцатый': 12, 'двенадцатую': 12, 'двенадцатой': 12,
+    'тринадцатое': 13, 'тринадцатый': 13, 'тринадцатую': 13, 'тринадцатой': 13,
+    'четырнадцатое': 14, 'четырнадцатый': 14, 'четырнадцатую': 14, 'четырнадцатой': 14,
+    'пятнадцатое': 15, 'пятнадцатый': 15, 'пятнадцатую': 15, 'пятнадцатой': 15,
+    'шестнадцатое': 16, 'шестнадцатый': 16, 'шестнадцатую': 16, 'шестнадцатой': 16,
+    'семнадцатое': 17, 'семнадцатый': 17, 'семнадцатую': 17, 'семнадцатой': 17,
+    'восемнадцатое': 18, 'восемнадцатый': 18, 'восемнадцатую': 18, 'восемнадцатой': 18,
+    'девятнадцатое': 19, 'девятнадцатый': 19, 'девятнадцатую': 19, 'девятнадцатой': 19,
+    'двадцатое': 20, 'двадцатый': 20, 'двадцатую': 20, 'двадцатой': 20
+}
 try:
     import pymorphy3
     MORPH_AVAILABLE = True
@@ -352,10 +373,12 @@ class SmartRecipeBot:
         total_results = len(self.session_state['all_search_results'])
         current_page = self.session_state['current_page']
         shown_count = len(found_recipes)
-        start_idx = current_page * 5 + 1
-        end_idx = start_idx + shown_count - 1
         
-        return f"Нашла {total_results} рецептов (показано {start_idx}-{end_idx}):"
+        # ПРАВИЛЬНО вычисляем номера для текущей страницы
+        start_number = current_page * 5 + 1
+        end_number = start_number + shown_count - 1
+        
+        return f"Нашла {total_results} рецептов (показано {start_number}-{end_number}):"
 
     def format_recipe_response(self, recipe: Dict[str, Any]) -> str:
         """Форматирует полный рецепт"""
@@ -393,19 +416,21 @@ class SmartRecipeBot:
         # Если только один рецепт, все равно показываем список для выбора
         recipes_to_show = recipes
         self.session_state['waiting_for_selection'] = True
-
+        current_page = self.session_state['current_page']
+        
         response = []
         for i, (recipe, score) in enumerate(recipes_to_show, 1):
             title = recipe.get('title', 'Рецепт без названия')
             time_info = f" ({recipe['time']})" if recipe.get('time') else ""
-            tags_info = f" [{', '.join(recipe['tags'])}]" if recipe.get('tags') else ""
-            response.append(f"{i}. {title}{time_info}{tags_info}")
+            
+            # ВАЖНО: Используем глобальный номер, а не локальный для страницы
+            global_index = i + 5 * current_page
+            response.append(f"{global_index}. {title}{time_info}")
 
         total_results = len(self.session_state['all_search_results'])
-        current_page = self.session_state['current_page']
         
         pagination_info = f"\n\nСтраница {current_page + 1} из {((total_results - 1) // 5) + 1}"
-        navigation_info = "\nУкажите номер рецепта (1, 2, 3... или первое, второе, третье...), название для выбора. Или напишите 'другой рецепт' для нового поиска."
+        navigation_info = "\nУкажите номер рецепта 1, 2, 3... или название для выбора. Напишите 'другой рецепт' для нового поиска."
         
         return "\n" + "\n".join(response) + pagination_info + navigation_info
 
@@ -431,31 +456,23 @@ class SmartRecipeBot:
         if not clean_message:
             clean_message = message_lower
             
-        # Проверяем номер (цифры)
+        # Получаем все результаты для проверки глобальных номеров
+        all_results = self.session_state['all_search_results']
+        
+        # Проверяем номер (цифры) - теперь проверяем глобальные номера
         if clean_message.isdigit():
             number = int(clean_message)
-            return 1 <= number <= len(self.last_search_results)
+            return 1 <= number <= len(all_results)
         
-        # Проверяем словесные обозначения номеров
-        number_words = {
-            'первое': 1, 'первый': 1, 'первую': 1, 'первой': 1,
-            'второе': 2, 'второй': 2, 'вторую': 2, 'второй': 2,
-            'третье': 3, 'третий': 3, 'третью': 3, 'третьей': 3,
-            'четвертое': 4, 'четвертый': 4, 'четвертую': 4, 'четвертой': 4,
-            'пятое': 5, 'пятый': 5, 'пятую': 5, 'пятой': 5,
-            'шестое': 6, 'шестой': 6, 'шестую': 6, 'шестой': 6,
-            'седьмое': 7, 'седьмой': 7, 'седьмую': 7, 'седьмой': 7,
-            'восьмое': 8, 'восьмой': 8, 'восьмую': 8, 'восьмой': 8,
-            'девятое': 9, 'девятый': 9, 'девятую': 9, 'девятой': 9,
-            'десятое': 10, 'десятый': 10, 'десятую': 10, 'десятой': 10
-        }
+        # Проверяем словесные обозначения номеров (локальные на странице)
+        number_words = NUMBER_WORDS
         
         if clean_message in number_words:
             number = number_words[clean_message]
             return 1 <= number <= len(self.last_search_results)
             
-        # Проверяем по названию (также с очисткой от мешающих слов)
-        for recipe, score in self.last_search_results:
+        # Проверяем по названию (среди всех результатов)
+        for recipe, score in all_results:
             title = recipe.get('title', '').lower()
             
             # Точное совпадение или частичное
@@ -482,39 +499,36 @@ class SmartRecipeBot:
             clean_selection = selection_lower
 
         # Словарь словесных обозначений номеров
-        number_words = {
-            'первое': 1, 'первый': 1, 'первую': 1, 'первой': 1,
-            'второе': 2, 'второй': 2, 'вторую': 2, 'второй': 2,
-            'третье': 3, 'третий': 3, 'третью': 3, 'третьей': 3,
-            'четвертое': 4, 'четвертый': 4, 'четвертую': 4, 'четвертой': 4,
-            'пятое': 5, 'пятый': 5, 'пятую': 5, 'пятой': 5,
-            'шестое': 6, 'шестой': 6, 'шестую': 6, 'шестой': 6,
-            'седьмое': 7, 'седьмой': 7, 'седьмую': 7, 'седьмой': 7,
-            'восьмое': 8, 'восьмой': 8, 'восьмую': 8, 'восьмой': 8,
-            'девятое': 9, 'девятый': 9, 'девятую': 9, 'девятой': 9,
-            'десятое': 10, 'десятый': 10, 'десятую': 10, 'десятой': 10
-        }
+        number_words = NUMBER_WORDS
 
-        # Выбор по номеру (цифры)
+        # Получаем все результаты поиска и текущую страницу
+        all_results = self.session_state['all_search_results']
+        current_page = self.session_state['current_page']
+        
+        # Выбор по номеру (цифры) - теперь работаем с глобальными номерами
         if clean_selection.isdigit():
-            number = int(clean_selection)
-            if 1 <= number <= len(self.last_search_results):
-                recipe, score = self.last_search_results[number - 1]
+            selected_number = int(clean_selection)
+            
+            # Проверяем, что номер в пределах общего количества результатов
+            if 1 <= selected_number <= len(all_results):
+                # Находим рецепт по глобальному номеру
+                recipe, score = all_results[selected_number - 1]
                 self.session_state['previous_recipes'].append(recipe.get('title'))
                 self.session_state['waiting_for_selection'] = False
                 return recipe
 
-        # Выбор по словесному номеру
+        # Выбор по словесному номеру - теперь работаем с локальными номерами на странице
         if clean_selection in number_words:
-            number = number_words[clean_selection]
-            if 1 <= number <= len(self.last_search_results):
-                recipe, score = self.last_search_results[number - 1]
+            local_number = number_words[clean_selection]
+            # Проверяем, что локальный номер в пределах текущей страницы
+            if 1 <= local_number <= len(self.last_search_results):
+                recipe, score = self.last_search_results[local_number - 1]
                 self.session_state['previous_recipes'].append(recipe.get('title'))
                 self.session_state['waiting_for_selection'] = False
                 return recipe
 
-        # Выбор по названию
-        for recipe, score in self.last_search_results:
+        # Выбор по названию (ищем среди всех результатов)
+        for recipe, score in all_results:
             title = recipe.get('title', '').lower()
             
             # Точное совпадение или частичное
